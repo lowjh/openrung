@@ -6,6 +6,9 @@ name: Auto Sync & Build DMG
 on:
   schedule:
     - cron: '0 2 * * *'
+  push:
+    branches:
+      - main
   workflow_dispatch:
 
 permissions:
@@ -19,6 +22,8 @@ jobs:
   sync:
     name: Sync upstream to fork
     runs-on: ubuntu-latest
+    outputs:
+      changed: ${{ steps.sync.outputs.changed }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -27,6 +32,7 @@ jobs:
           persist-credentials: true
 
       - name: Merge upstream main
+        id: sync
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
@@ -34,16 +40,19 @@ jobs:
           git fetch upstream main
           if git merge-base --is-ancestor upstream/main HEAD; then
             echo "upstream already merged; nothing to sync"
+            echo "changed=false" >> "$GITHUB_OUTPUT"
           else
             git merge --ff-only upstream/main || git merge upstream/main --no-edit
             git push origin main
             echo "synced and pushed"
+            echo "changed=true" >> "$GITHUB_OUTPUT"
           fi
 
   build:
     name: Build DMG and publish release
     runs-on: macos-14
     needs: sync
+    if: needs.sync.outputs.changed == 'true'
     steps:
       - uses: actions/checkout@v4
         with:
