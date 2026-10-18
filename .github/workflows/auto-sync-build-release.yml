@@ -97,4 +97,3 @@ jobs:
             --title "OpenRung auto build ($TAG)" \
             --notes "自动同步 openrung 官方仓库后构建的 macOS arm64 DMG。
 首次打开如被 Gatekeeper 拦截：右键点击 OpenRung.app -> 打开。" || true
-# 自动同步 openrung/openrung 并构建 DMG 发布 Release
