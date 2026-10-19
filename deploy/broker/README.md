@@ -57,7 +57,8 @@ below).
 With no `OPENRUNG_VOLUNTEER_TOKEN` set it runs open (anonymous registration); set
 one to require auth. Optional overrides: `OPENRUNG_REGION`, `OPENRUNG_BUNDLE`,
 `OPENRUNG_DASHBOARD_TOKEN`, `OPENRUNG_RELAY_STORE` / `OPENRUNG_RELAY_DATABASE_URL`,
-`OPENRUNG_GEOIP_ENDPOINT`. The script prints the health URL and the
+`OPENRUNG_GEOIP_ENDPOINT`; the reachability probe settings below go in the env
+file. The script prints the health URL and the
 `OPENRUNG_BROKER_URL=http://<ip>:8080` to point hubs and relay runtimes at. Front the
 origin with Cloudflare for TLS (below) and set the client apps' HTTPS broker URL
 to the Cloudflare hostname.
@@ -284,7 +285,31 @@ automatically) instead of the JSONL file. It uses
 needs no extra configuration; the broker refuses to start if neither is set.
 In postgres mode the admin dashboard aggregates in SQL, bounded by the
 selected time window, so dashboard cost and broker memory stay flat as event
-history grows. High-volume `application_connection` events are not stored as
+history grows. The 24h and 7d windows read a **dashboard rollup** rather than
+the event rows: `telemetry_sessions` holds one row per session (the same
+per-field "latest non-empty wins" accumulation the dashboard shows) and
+`telemetry_event_counts` holds hourly event-grain counts (connection trend,
+failure stages and reasons, per-relay successes, failures, speed tests and
+retained node class). Both are maintained by the same statement that inserts a
+batch of events, so they never lag ingestion, and they age out with the
+partitions. The 1h window still aggregates the hour's events directly. For
+the rollup-served windows a session belongs to the window when its latest
+event does, and the event-grain window edge is hour-granular, like the
+top-applications panel.
+
+On the first start after upgrading to a broker with the rollup, the broker
+**backfills** it from the partitions already on disk, in the background, one
+hour of `received_at` at a time with a short pause between chunks so relay
+polls are not starved; the watermark lives in `telemetry_rollup_state` and
+survives restarts. Until the backfill completes the 24h and 7d windows fall
+back to aggregating events directly (the pre-rollup behaviour), and the
+broker logs `telemetry rollup backfill started` / `complete`. Expect the
+backfill of a full seven-day history to take some minutes on a small
+instance. Downgrading to a broker without the rollup is safe (it ignores the
+three tables); to upgrade again after rows were written by such a broker,
+`TRUNCATE telemetry_sessions, telemetry_event_counts; DELETE FROM
+telemetry_rollup_state;` before starting it so the backfill re-covers the
+history. High-volume `application_connection` events are not stored as
 rows in either store: ingestion folds them into an hourly per-application
 count (`telemetry_app_counts` in postgres mode), summing the bounded optional
 `measurements.connection_count` used by aggregating clients and defaulting to
@@ -292,6 +317,32 @@ one for legacy or out-of-range integer values. One application can contribute
 at most 100,000 represented flows per batch. The aggregate feeds the
 dashboard's top-applications panel; per-event destination and client metadata
 is discarded.
+
+## Relay reachability probe
+
+The broker checks that every direct-transport relay's advertised
+`public_host:public_port` accepts inbound connections — a bounded TCP connect
+from the broker host when the relay registers, repeated on heartbeat once the
+result is five minutes old — and withholds a relay whose latest probe failed
+from the public list and access answers until a probe succeeds. The relay
+stays registered and visible in the inventory and the relays page with
+`reachable: false`. It is on by default:
+
+```sh
+OPENRUNG_RELAY_PROBE=off           # disable; every relay is listed on its lease alone
+OPENRUNG_RELAY_PROBE_TIMEOUT=5s    # time limit for one probe
+OPENRUNG_RELAY_PROBE_INTERVAL=5m   # re-probe on heartbeat once the result is this old
+```
+
+The probe runs from the broker host's own network, so the host needs egress to
+every address family the fleet advertises; a family the host has no route for
+is skipped (the relay keeps its previous result) rather than counted as
+unreachable. Only public unicast addresses are ever dialled — never loopback,
+private, link-local or the broker host's own — so an anonymous registration
+cannot use the broker to test ports near it. After deploying a broker, check
+the inventory for `"reachable": false` rows before assuming a relay is at
+fault. Switching the probe off ignores stored results immediately, so it is
+also the way to relist every withheld relay at once.
 
 ## Telemetry dashboard
 
