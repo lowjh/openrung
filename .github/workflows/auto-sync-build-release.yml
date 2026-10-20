@@ -30,6 +30,12 @@ jobs:
 
       - name: Merge upstream main
         id: sync
+        env:
+          # 推送合并结果必须使用带 workflows 权限的 PAT。
+          # 默认的 GITHUB_TOKEN 永远没有 workflows 权限，
+          # 上游一旦改动 .github/workflows/ 下的文件，直接用
+          # GITHUB_TOKEN push 会被 GitHub 拒绝（本次失败的根因）。
+          SYNC_PAT: ${{ secrets.SYNC_PAT }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
@@ -40,6 +46,7 @@ jobs:
             echo "changed=false" >> "$GITHUB_OUTPUT"
           else
             git merge --ff-only upstream/main || git merge upstream/main --no-edit
+            git remote set-url origin "https://x-access-token:${SYNC_PAT}@github.com/${GITHUB_REPOSITORY}.git"
             git push origin main
             echo "synced and pushed"
             echo "changed=true" >> "$GITHUB_OUTPUT"
