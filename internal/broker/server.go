@@ -41,6 +41,11 @@ type Config struct {
 	TelemetryReader  TelemetryReader
 	TelemetryQuerier TelemetryQuerier
 	DashboardToken   string
+	// Version and Revision identify the running broker build in the admin
+	// dashboard's footer; cmd/broker passes buildinfo's values. Empty renders
+	// "dev" with no revision.
+	Version  string
+	Revision string
 	// APIToken is the bearer credential for the machine-to-machine operational
 	// API (GET /admin/api/relays/inventory). It is deliberately separate from
 	// DashboardToken — that one buys an interactive browser session over the
@@ -102,6 +107,10 @@ type Config struct {
 	// EnrollmentBudget limits NEW user identities per source address (IPv6:
 	// per /64). Zero fields apply the defaults; see EnrollmentBudget.
 	EnrollmentBudget EnrollmentBudget
+	// SourceClassifier refuses NEW user identities from datacenter networks
+	// (source_class.go); nil disables the check. The caller keeps it fresh
+	// (SourceClassifier.Run).
+	SourceClassifier *SourceClassifier
 	// AccessLeaseTTL is how long an issued per-client relay credential stays
 	// valid without renewal (OPENRUNG_ACCESS_LEASE_TTL); zero applies the
 	// default (1 h). Renewal extends the same credential.
@@ -150,6 +159,9 @@ func NewServer(store RelayStore, cfg Config) http.Handler {
 		response := map[string]any{"ok": true, "signing_key_id": relaySigner.keyID}
 		if wssIssuer != nil {
 			response["wss_ticket_key_id"] = wssIssuer.signer.KeyID()
+		}
+		if cfg.SourceClassifier != nil {
+			response["source_classification_available"] = cfg.SourceClassifier.Available(time.Now())
 		}
 		writeJSON(w, http.StatusOK, response)
 	})
@@ -218,6 +230,7 @@ func NewServer(store RelayStore, cfg Config) http.Handler {
 	}
 	if cfg.DashboardToken != "" && querier != nil {
 		dashboard := newDashboardServer(cfg.DashboardToken, querier)
+		dashboard.version, dashboard.revision = cfg.Version, cfg.Revision
 		dashboard.relayDisplays = relayDisplayResolver(store)
 		dashboard.relayDirectory = store
 		dashboard.relayWeights = store
@@ -252,6 +265,13 @@ func registerHandler(store RelayStore, cfg Config, clientIP *clientIPResolver, l
 			return
 		}
 		req.Label = label
+
+		contact, err := relay.NormalizeOperatorContact(req.OperatorContact)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		req.OperatorContact = contact
 
 		nodeClass, err := relay.NormalizeNodeClass(req.NodeClass)
 		if err != nil {
@@ -312,6 +332,18 @@ func registerHandler(store RelayStore, cfg Config, clientIP *clientIPResolver, l
 			}()
 		}
 
+		// The relay listens before it registers, so its endpoint is probed in
+		// the same request, before anything is stored: a port nothing outside
+		// the host can reach is rejected with the reason, and the relay's own
+		// retry loop re-registers (and is re-probed) until it opens. See
+		// reachability.go. An inconclusive probe registers the relay unprobed.
+		probed, probeErr := probeRegistration(r.Context(), cfg.RelayProber, req)
+		if probeErr != nil {
+			slog.Warn("relay registration rejected: endpoint unreachable", "node_class", maxClass, "public", req.PublicHost, "port", req.PublicPort, "version", req.RelayVersion, "error", probeErr)
+			writeError(w, http.StatusUnprocessableEntity, unreachableRegistrationMessage(req))
+			return
+		}
+
 		desc, err := store.Register(req, now, cfg.RelayLeaseTTL)
 		// A malformed or stale identity proof fails the registration loudly
 		// instead of silently falling back to a random relay ID — a relay that
@@ -343,10 +375,9 @@ func registerHandler(store RelayStore, cfg Config, clientIP *clientIPResolver, l
 		// identity can never drain more than one unit of an address's budget.
 		keepReservation = ledger.rememberIfNew(desc.ID, desc.NodeClass, now)
 		resolveRelayGeo(r.Context(), store, cfg.GeoIP, &desc)
-		// The relay listens before it registers, so its endpoint is probed in
-		// the same request and the response reports the result; a relay that
-		// fails it is registered but not listed (see reachability.go).
-		probeRelayReachability(r.Context(), store, cfg.RelayProber, cfg.RelayProbeInterval, &desc, now)
+		if probed {
+			recordReachability(store, &desc, true, now)
+		}
 		slog.Info("relay registered", "relay_id", desc.ID, "node_class", desc.NodeClass, "public", desc.PublicHost, "port", desc.PublicPort, "city", desc.City, "country", desc.Country, "max_sessions", desc.MaxSessions, "version", desc.RelayVersion, "reachable", reachabilityLogValue(desc))
 
 		writeJSON(w, http.StatusCreated, relay.RegisterResponse{Descriptor: desc})

@@ -212,6 +212,72 @@ lease lifetime and caps. Deploy the broker before updating relays: the
 capability is recorded at registration, and a relay only starts its syncer
 when the broker echoes it.
 
+### Datacenter source classification
+
+With user authentication enabled, the broker can refuse to enroll **new**
+user identities from datacenter and hosting networks (`403` with code
+`datacenter_source`, see `docs/api.md`). An identity that already exists
+authenticates from any network. Classification is off until both data files
+are configured, and it never makes a network request: it is a lookup in two
+local files that `refresh-source-asn.sh` keeps current.
+
+| File | Source | Licence |
+| --- | --- | --- |
+| `ip2asn.tsv` — IP range → ASN, IPv4 and IPv6 | [iptoasn.com](https://iptoasn.com/) `ip2asn-combined.tsv.gz` (updated hourly upstream) | Public Domain Dedication and License (PDDL) |
+| `datacenter-asns.txt` — datacenter/hosting ASNs | [bad-asn-list](https://github.com/brianhama/bad-asn-list), a published list of cloud, managed hosting and colocation ASNs, plus the optional local file `datacenter-asns.local` | MIT |
+
+Neither file is committed to this repository. The list's format is one ASN
+per line (`AS64500` or `64500`, with anything after the number ignored, so
+both the CSV and `AS… # comment` styles work); put operator additions, one per
+line, in `datacenter-asns.local` next to the generated files. Any other
+source that produces the same two formats works too
+(`OPENRUNG_SOURCE_ASN_URL`, `OPENRUNG_DATACENTER_ASN_URL`).
+
+Set it up on the broker host:
+
+```sh
+sudo install -d -m 0755 /var/lib/openrung-source
+sudo install -m 0755 deploy/broker/refresh-source-asn.sh /usr/local/sbin/refresh-source-asn
+sudo /usr/local/sbin/refresh-source-asn            # first fetch; prints the row and ASN counts
+# daily refresh (any hour; the upstream table changes hourly, slowly)
+echo '17 4 * * * root /usr/local/sbin/refresh-source-asn >/dev/null' | sudo tee /etc/cron.d/openrung-source-asn
+```
+
+then mount the directory read-only into the broker container
+(`-v /var/lib/openrung-source:/var/lib/openrung-source:ro`; the compose file
+has the line commented out) and add to the env file:
+
+```sh
+OPENRUNG_SOURCE_ASN_DB=/var/lib/openrung-source/ip2asn.tsv
+OPENRUNG_DATACENTER_ASN_LIST=/var/lib/openrung-source/datacenter-asns.txt
+#OPENRUNG_SOURCE_ASN_MAX_AGE=168h
+#OPENRUNG_ENROLLMENT_EXEMPT_CIDRS=
+```
+
+The script validates both downloads before replacing either file: every
+table line must hold two addresses of one family in ascending order and a
+32-bit ASN (it refuses anything the broker's loader would reject), and both
+files must meet minimum row and ASN counts. Files are replaced atomically and
+only when both pass, so a failed refresh leaves the previous data in place. The broker re-reads the files
+within a minute of a change, logs the number of datacenter ASNs and ranges it
+loaded, and keeps its previous data if a new file fails to parse. The table's
+modification time dates the data: once it is older than
+`OPENRUNG_SOURCE_ASN_MAX_AGE` (default 7 days), or while no data has loaded,
+new enrollments get a retryable `503` (`Retry-After: 300`, code
+`source_unclassified`) and `/healthz` reports
+`"source_classification_available": false` — alert on that rather than on
+user reports. Setting only one of the two paths refuses to start.
+
+Classification needs the **real** client address: behind a front, the
+broker must see it through `OPENRUNG_TRUSTED_PROXY_CIDRS` (see Fronting with Cloudflare
+below), or every enrollment arrives from the front's own (datacenter)
+network and is refused. `OPENRUNG_ENROLLMENT_EXEMPT_CIDRS` (comma-separated)
+lists sources that are never refused, for example a test network.
+
+Refusals are counted in the ten-minute `access requests` summary line
+(`enroll_refused_datacenter`, `enroll_unclassified`); individual requests
+are not logged.
+
 ## WSS ticket signing and relay public-key handoff
 
 WSS ticket signing is optional and uses a dedicated Ed25519 key. Set
@@ -283,50 +349,39 @@ automatically) instead of the JSONL file. It uses
 `OPENRUNG_TELEMETRY_DATABASE_URL`, falling back to
 `OPENRUNG_RELAY_DATABASE_URL` so a broker already on the Postgres relay store
 needs no extra configuration; the broker refuses to start if neither is set.
-In postgres mode the admin dashboard aggregates in SQL, bounded by the
-selected time window, so dashboard cost and broker memory stay flat as event
-history grows. The 24h and 7d windows read a **dashboard rollup** rather than
-the event rows: `telemetry_sessions` holds one row per session (the same
-per-field "latest non-empty wins" accumulation the dashboard shows) and
-`telemetry_event_counts` holds hourly event-grain counts (connection trend,
-failure stages and reasons, per-relay successes, failures, speed tests and
-retained node class). Both are maintained by the same statement that inserts a
-batch of events, so they never lag ingestion, and they age out with the
-partitions. The 1h window still aggregates the hour's events directly. For
-the rollup-served windows a session belongs to the window when its latest
-event does, and the event-grain window edge is hour-granular, like the
-top-applications panel.
-
-On the first start after upgrading to a broker with the rollup, the broker
-**backfills** it from the partitions already on disk, in the background, one
-hour of `received_at` at a time with a short pause between chunks so relay
-polls are not starved; the watermark lives in `telemetry_rollup_state` and
-survives restarts. Until the backfill completes the 24h and 7d windows fall
-back to aggregating events directly (the pre-rollup behaviour), and the
-broker logs `telemetry rollup backfill started` / `complete`. Expect the
-backfill of a full seven-day history to take some minutes on a small
-instance. Downgrading to a broker without the rollup is safe (it ignores the
-three tables); to upgrade again after rows were written by such a broker,
-`TRUNCATE telemetry_sessions, telemetry_event_counts; DELETE FROM
-telemetry_rollup_state;` before starting it so the backfill re-covers the
-history. High-volume `application_connection` events are not stored as
-rows in either store: ingestion folds them into an hourly per-application
-count (`telemetry_app_counts` in postgres mode), summing the bounded optional
-`measurements.connection_count` used by aggregating clients and defaulting to
-one for legacy or out-of-range integer values. One application can contribute
-at most 100,000 represented flows per batch. The aggregate feeds the
-dashboard's top-applications panel; per-event destination and client metadata
-is discarded.
+In postgres mode the admin dashboard aggregates in SQL, bounded by the selected
+time window, so dashboard cost and broker memory stay flat as event history
+grows. Event partitions are dropped after 7 days. The dashboard rollup the
+24-hour and longer windows read (`telemetry_sessions`, one row per session, and
+`telemetry_event_counts`, hourly counts) is kept for 31 days so the 14- and
+31-day windows have history; the daily prune blanks the client IP fields, city,
+ISP, organization, and ASN on rollup sessions older than 7 days, so IP-level
+data is never kept longer than the raw events. A broker older than 0.9.3 prunes
+the rollup back to 7 days on its next maintenance pass, and the extra rows and
+the BRIN index are harmless to it. High-volume `application_connection` events
+are not stored as rows in either store: ingestion folds them into an hourly
+per-application count (`telemetry_app_counts` in postgres mode), summing the
+bounded optional `measurements.connection_count` used by aggregating clients
+and defaulting to one for legacy or out-of-range integer values. One
+application can contribute at most 100,000 represented flows per batch. The
+aggregate feeds the dashboard's top-applications panel; per-event destination
+and client metadata is discarded.
 
 ## Relay reachability probe
 
 The broker checks that every direct-transport relay's advertised
-`public_host:public_port` accepts inbound connections — a bounded TCP connect
-from the broker host when the relay registers, repeated on heartbeat once the
-result is five minutes old — and withholds a relay whose latest probe failed
-from the public list and access answers until a probe succeeds. The relay
-stays registered and visible in the inventory and the relays page with
-`reachable: false`. It is on by default:
+`public_host:public_port` accepts inbound connections with a bounded TCP
+connect from the broker host. At registration the check gates admission: a
+relay whose port cannot be reached is refused (`422`, body `public endpoint
+unreachable: ...`, no `Retry-After` so the relay's quick startup retries log
+the refusal within seconds), nothing is stored, and the relay's own retries
+re-run the check until the port opens; the relay logs the
+refusal verbatim, which is what `volunteer-up.sh` reads to tell its operator
+which firewall to open. A relay that registered reachable is re-checked on a
+heartbeat once its result is five minutes old, and one whose latest check
+failed is withheld from the public list and access answers until a check
+succeeds, staying registered and visible in the inventory and the relays
+page with `reachable: false`. It is on by default:
 
 ```sh
 OPENRUNG_RELAY_PROBE=off           # disable; every relay is listed on its lease alone
@@ -347,7 +402,7 @@ also the way to relist every withheld relay at once.
 ## Telemetry dashboard
 
 Set `OPENRUNG_DASHBOARD_TOKEN` to a long random string to enable the protected
-dashboard at `/admin/telemetry`. When unset, the dashboard and its data API
+dashboard at `/admin/dashboard`. When unset, the dashboard and its data API
 return 404. Always serve it over HTTPS so the admin session cookie is protected.
 
 ## Operational relay inventory
@@ -433,7 +488,7 @@ descriptor also carries its effective `ranking_weight`, so a fleet audit shows
 where load has been shifted. As with the inventory, call the **origin**, not
 the public front.
 
-The telemetry dashboard's relays page (`/admin/telemetry/relays`) exposes the
+The admin dashboard's relays page (`/admin/dashboard/relays`) exposes the
 same dial as a **Weight** column with an inline Save/Reset control per relay,
 behind the dashboard session cookie rather than the API token (mutations must be
 same-origin, judged from the browser's `Sec-Fetch-Site` so the check also holds
@@ -532,10 +587,14 @@ docker inspect openrung-broker \
 | `OPENRUNG_ACCESS_TOKEN_TTL`          | no       | `24h`                               | Lifetime of client access tokens (`1m`–`168h`)                 |
 | `OPENRUNG_ENROLLMENT_BURST_LIMIT`    | no       | `3`                                 | New user identities per source address (IPv6: /64) per hour; negative disables |
 | `OPENRUNG_ENROLLMENT_DAILY_LIMIT`    | no       | `10`                                | New user identities per source address per 24 h; negative disables |
+| `OPENRUNG_SOURCE_ASN_DB`             | no       | —                                   | IP-to-ASN table (iptoasn TSV); with the list below, refuses new user identities from datacenter networks |
+| `OPENRUNG_DATACENTER_ASN_LIST`       | no       | —                                   | Datacenter/hosting ASN list, one per line; required with `OPENRUNG_SOURCE_ASN_DB` |
+| `OPENRUNG_SOURCE_ASN_MAX_AGE`        | no       | `168h`                              | Table age past which new enrollments get a retryable `503`     |
+| `OPENRUNG_ENROLLMENT_EXEMPT_CIDRS`   | no       | none                                | Source CIDRs never refused as datacenter sources               |
 | `OPENRUNG_ACCESS_LEASE_TTL`          | no       | `1h`                                | Lifetime of a per-client relay credential (access lease) without renewal (`1m`–`24h`) |
 | `OPENRUNG_MAX_LEASES_PER_USER`       | no       | `10`                                | Live access leases one user may hold across the fleet; the least recently renewed are revoked at the cap |
 | `OPENRUNG_MAX_LEASES_PER_RELAY`      | no       | `2000`                              | Live access leases one relay may hold; a relay at the cap is skipped by issuance |
-| `OPENRUNG_DASHBOARD_TOKEN`           | no       | —                                   | Enables the protected `/admin/telemetry` dashboard             |
+| `OPENRUNG_DASHBOARD_TOKEN`           | no       | —                                   | Enables the protected `/admin/dashboard` dashboard             |
 | `OPENRUNG_API_TOKEN`                 | no       | —                                   | Enables `/admin/api/relays/inventory` and the ranking-weight endpoints; must differ from every other credential |
 | `OPENRUNG_ADDR`                      | no       | `:8080`                             | HTTP listen address                                            |
 | `OPENRUNG_TRUSTED_PROXY_CIDRS`       | no       | none                                | Proxy CIDRs trusted for forwarded client IPs                   |
