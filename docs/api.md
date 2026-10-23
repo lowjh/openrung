@@ -375,7 +375,7 @@ registered (`offline_relays`), live sessions across the fleet, and the distinct
 count of clients currently connected through any relay.
 
 Each relay row carries the registry half for online relays — label, class,
-public endpoint, operator contact (when the relay registered one), transport, exit location (city/country as resolved by the
+public endpoint, access address and operator contact (when the relay registered them), transport, exit location (city/country as resolved by the
 broker), relay software version, capacity, punch/WSS capability, registration
 and last-heartbeat times — merged with per-relay telemetry for the window:
 currently connected clients and active sessions, unique clients and sessions,
@@ -396,6 +396,43 @@ neither mint offline rows nor inflate the connected-clients count. As a
 second bound, the response lists at most 200 offline rows (the busiest); the
 totals still count every attested offline relay, and the page notes when rows
 were hidden.
+
+### Users page
+
+The sidebar's Users page (`/admin/dashboard/users`) is the operator's view of
+[client users](#client-users-spec-openrung-user-auth-v1) and their
+[access leases](#relay-lease-sync), backed by:
+
+```http
+GET /admin/api/dashboard/users?status=&sort=last_auth&offset=0&limit=50
+GET /admin/api/dashboard/users/{ref}
+PUT /admin/api/dashboard/users/{id}/status
+```
+
+The list takes the same parameters and returns the same rows as the
+[operational list](#operational-user-endpoints). `{ref}` on the detail route is
+a user ID, a lease label as relays log it (`lease-<id>`), or a bare lease ID,
+which resolves to the lease's owner (`matched_lease` names it), so an operator
+can go from a relay log line to the user. The detail carries the user's row
+(status timeline and lease counters), its 50 most recently created retained
+leases with each lease's status (`live`, `expired`, `revoked`) and the relay's
+label while the relay is registered, `leases_total`, and
+`lease_retention_days` (leases are deleted seven days after they expire).
+Unknown, malformed and retention-expired references are `404`.
+
+The status route is the same implementation as the operational
+`PUT /admin/api/users/{id}/status` — same body, validation and response —
+behind the dashboard session instead of the token, with the
+[dashboard mutation guards](#dashboard-weight-endpoints) (`415` without a JSON
+content type, `403` cross-origin). Each change is logged on the one
+`user status changed` line, whose `via` field names the door (`dashboard` or
+`operational api`). The page requires a reason and a confirmation before it
+disables a user, and states that disabling stops new connections within
+seconds (live leases are revoked and relays drop them on their next sync) but
+does not terminate an established session. Responses never include public
+keys, lease credentials, client source addresses or telemetry identifiers.
+Without client users configured (`OPENRUNG_USER_TOKEN_KEY`) these routes
+answer `503`.
 
 ## Operational relay inventory
 
@@ -461,8 +498,11 @@ reachability probe](#inbound-reachability-probe): `reachable` is `null` until
 the broker has probed the relay (tunnel transport, probing off, or not yet),
 otherwise `true` or `false`, with `reachability_checked_at` giving the probe
 time when there is one. A `false` relay is registered but withheld from
-clients. `operator_contact` is the contact the relay registered with (see
-[Register Relay](#register-relay)), omitted when it sent none. Lease
+clients. `operator_contact` is the contact the relay registered with and
+`access_host` its access address (see [Register Relay](#register-relay));
+each is omitted when the relay sent none, and both appear only in this
+trailing operator block, never in the descriptor fields the inventory shares
+with the public directory. Lease
 tokens, stable-identity keys and proofs, hub-observed exit addresses,
 telemetry, and signing seeds never appear here; the endpoint exposes fleet
 membership, not credentials.
@@ -477,7 +517,7 @@ Response:
   "key_id": "3097e2dee2cb4a34",
   "channel": "inventory",
   "relays": [
-    { "id": "relay_0a1b...", "public_host": "203.0.113.7", "public_port": 443, "node_class": "foundation", "...": "...", "ranking_weight": 1, "reachable": true, "reachability_checked_at": "2026-06-09T06:58:00Z", "operator_contact": "ops@example.org" }
+    { "id": "relay_0a1b...", "public_host": "203.0.113.7", "public_port": 443, "node_class": "foundation", "...": "...", "ranking_weight": 1, "reachable": true, "reachability_checked_at": "2026-06-09T06:58:00Z", "operator_contact": "ops@example.org", "access_host": "2001:db8:1::10" }
   ]
 }
 ```
@@ -648,7 +688,8 @@ Request:
   "transport": "direct",
   "node_class": "volunteer",
   "access_leases": true,
-  "operator_contact": "ops@example.org"
+  "operator_contact": "ops@example.org",
+  "access_host": "2001:db8:1::10"
 }
 ```
 
@@ -662,6 +703,22 @@ registration and shows it only in the [operational relay
 inventory](#operational-relay-inventory) and the admin relays page: it is not
 bound by the identity statement and never appears in the registration response,
 relay lists, or any signed client-facing body.
+
+`access_host` (optional) is an IPv6 address, distinct from `public_host`, on
+which the relay serves the same listener. It must be a bare global unicast
+IPv6 literal (no brackets, zone or IPv4-mapped form, not unique-local), may not
+name the same address as `public_host`, and is accepted for direct transport
+only; anything else is refused with `400`. It is honoured only for
+identity-bearing registrations (a legacy identityless registration's is
+dropped) and is replaced, or cleared, by every re-registration; heartbeats
+keep it. It is not bound by the identity statement. The broker uses it in one
+place: the [client access](#client-access) answer to a request that arrived
+over IPv6 names it as the relay's `public_host`. The registration response, relay lists, the [inbound
+reachability probe](#inbound-reachability-probe) and every other surface keep
+`public_host`; only the operator inventory and the admin relays page show the
+access address. The reference relay sends it (`OPENRUNG_ACCESS_HOST`) only after
+confirming the address is configured on a host interface; see
+`deploy/relay/README.md`.
 
 `access_leases` (optional, default `false`) declares that the relay installs
 broker-issued per-client credentials through the [relay lease
@@ -1401,6 +1458,47 @@ logged with the caller's IP. Unknown or malformed IDs are `404`; the routes
 share the operational API's limiter and exist only when both
 `OPENRUNG_API_TOKEN` and `OPENRUNG_USER_TOKEN_KEY` are configured.
 
+```http
+GET /admin/api/users?status=disabled&sort=leases_24h&offset=0&limit=50
+Authorization: Bearer <OPENRUNG_API_TOKEN>
+```
+
+Lists users one page at a time. `status` (`enabled` or `disabled`) filters;
+`sort` is `last_auth` (default: most recently authenticated first),
+`leases_24h` (most leases issued in the last 24 hours first) or `enrolled`
+(newest first), with the user ID as the final tiebreak; `limit` is 1–100
+(default 50) and `offset` is zero or more. Invalid parameters are `400`.
+Each row is the operator view above plus three counters derived from access
+leases — the broker keeps no per-user traffic volume, so lease activity is the
+only volume signal:
+
+```json
+{
+  "generated_at": "2026-10-16T16:00:00Z",
+  "sort": "leases_24h",
+  "total": 1,
+  "offset": 0,
+  "limit": 50,
+  "users": [
+    {
+      "user_id": "user_0123456789abcdef0123456789abcdef",
+      "status": "enabled",
+      "created_at": "2026-10-16T12:00:00Z",
+      "last_auth_at": "2026-10-16T15:55:00Z",
+      "live_leases": 2,
+      "leases_issued_24h": 6,
+      "relays_24h": 3
+    }
+  ]
+}
+```
+
+`live_leases` counts leases neither revoked nor expired, `leases_issued_24h`
+counts leases created in the last 24 hours (a renewal extends a lease rather
+than issuing one), and `relays_24h` counts distinct relays among leases
+issued or renewed in the last 24 hours. `total` counts every user matching the
+filter. The route shares the limiter and the configuration requirements above.
+
 ## Client access
 
 ```http
@@ -1469,7 +1567,12 @@ channel, without `limit`, and with the lease expiry:
 
 Each descriptor's `client_id` is the caller's credential for that relay; it
 stops being accepted at `lease_expires_at` (compare with `server_time`, not the
-local clock). Clients must verify the signature and require
+local clock). For a relay that registered an `access_host`, and only when the
+access request itself arrived over IPv6 (as seen by the broker, through a
+trusted front the viewer's address), the descriptor's `public_host` is that
+access address instead of the address the public relay list carries. A request
+over IPv4 gets the public host. Every other field is the relay's public
+descriptor either way. Clients must verify the signature and require
 `channel == "access"`; a public list never verifies here and an access body
 never verifies as a public list.
 
