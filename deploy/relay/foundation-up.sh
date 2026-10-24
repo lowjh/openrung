@@ -785,6 +785,82 @@ WantedBy=multi-user.target
 UNIT
 }
 
+# A network manager that reconfigures the interface (systemd-networkd restarting
+# under unattended upgrades, for one) drops addresses it does not own, and the
+# one-shot unit above would stay "active" without the address. Every minute the
+# re-assert timer runs a tiny script that re-adds the address the unit names
+# (read from its ExecStart line) when it is missing or no longer deprecated,
+# and logs a warning only then; while the address is in place it is silent,
+# and LogLevelMax keeps systemd's own per-run lines out of the journal too. It
+# runs only while the unit is active, so stopping the unit (an `off` or an
+# address change) is never undone. None of the three files names the address.
+ACCESS_REASSERT_NAME=openrung-access-address-reassert
+ACCESS_REASSERT_SCRIPT=/usr/local/sbin/${ACCESS_REASSERT_NAME}
+ACCESS_REASSERT_SERVICE=/etc/systemd/system/${ACCESS_REASSERT_NAME}.service
+ACCESS_REASSERT_TIMER=/etc/systemd/system/${ACCESS_REASSERT_NAME}.timer
+
+access_reassert_script() {
+  cat <<'SCRIPT'
+#!/bin/sh
+# Re-add the access address that openrung-access-address.service configures
+# when the interface has lost it (or it lost its deprecated flag). Silent
+# while the address is in place; logs a warning only when it re-adds it.
+set -eu
+SCRIPT
+  printf 'unit=%s
+' "$ACCESS_UNIT"
+  cat <<'SCRIPT'
+set -- $(sed -n "s#^ExecStart=/sbin/ip -6 address replace \([^ ]*\)/128 dev \([^ ]*\) .*#\1 \2#p" "$unit")
+if [ "$#" -ne 2 ]; then
+  echo "<3>cannot read the access address from $unit"
+  exit 1
+fi
+if ip -6 -o address show to "$1/128" | grep -q deprecated; then
+  exit 0
+fi
+ip -6 address replace "$1/128" dev "$2" preferred_lft 0 nodad
+echo "<4>re-added access address $1 on $2"
+SCRIPT
+}
+
+access_reassert_service() {
+  cat <<UNIT
+[Unit]
+Description=Re-add the OpenRung relay access address if it is missing
+After=${ACCESS_UNIT_NAME}
+
+[Service]
+Type=oneshot
+LogLevelMax=notice
+ExecCondition=/bin/systemctl is-active --quiet ${ACCESS_UNIT_NAME}
+ExecStart=${ACCESS_REASSERT_SCRIPT}
+UNIT
+}
+
+access_reassert_timer() {
+  cat <<UNIT
+[Unit]
+Description=Re-assert the OpenRung relay access address every minute
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=1min
+AccuracySec=5s
+
+[Install]
+WantedBy=timers.target
+UNIT
+}
+
+# Install (idempotently) and start the re-assert timer.
+install_access_reassert() { # host
+  local host="$1"
+  access_reassert_script | ssh_run "$host" "sudo tee ${ACCESS_REASSERT_SCRIPT}.new >/dev/null && sudo chmod 0755 ${ACCESS_REASSERT_SCRIPT}.new && sudo mv ${ACCESS_REASSERT_SCRIPT}.new ${ACCESS_REASSERT_SCRIPT}" \
+    && access_reassert_service | ssh_run "$host" "sudo tee ${ACCESS_REASSERT_SERVICE} >/dev/null" \
+    && access_reassert_timer | ssh_run "$host" "sudo tee ${ACCESS_REASSERT_TIMER} >/dev/null" \
+    && ssh_run "$host" "sudo systemctl daemon-reload && sudo systemctl enable --now ${ACCESS_REASSERT_NAME}.timer >/dev/null 2>&1"
+}
+
 # An access address change is split around the roll so that a failure at any
 # point leaves the previous relay with exactly the addresses it had:
 #   prepare_access_address  (before the roll) adds the new address beside any
@@ -851,6 +927,12 @@ commit_access_address() { # host
   [ -n "$ACCESS_HOST" ] || return 0
   if [ "$ACCESS_HOST" = off ]; then
     ssh_run "$host" "set -e
+      if sudo test -f ${ACCESS_REASSERT_TIMER} || sudo test -f ${ACCESS_REASSERT_SERVICE}; then
+        sudo systemctl disable --now ${ACCESS_REASSERT_NAME}.timer >/dev/null 2>&1 || true
+        sudo systemctl stop ${ACCESS_REASSERT_NAME}.service >/dev/null 2>&1 || true
+        sudo rm -f ${ACCESS_REASSERT_TIMER} ${ACCESS_REASSERT_SERVICE} ${ACCESS_REASSERT_SCRIPT}
+        sudo systemctl daemon-reload
+      fi
       if sudo test -f ${ACCESS_UNIT}; then
         sudo systemctl disable --now ${ACCESS_UNIT_NAME} >/dev/null 2>&1 || true
         sudo rm -f ${ACCESS_UNIT}
@@ -874,6 +956,11 @@ commit_access_address() { # host
       exit 0
     fi
     had_old=0
+    # A re-assert run that read the old unit could re-add its address after
+    # the stop below removes it: stop the timer and wait out a run in
+    # progress (systemctl stop returns once it has exited) before any
+    # address is touched. install_access_reassert starts the timer again.
+    sudo systemctl stop ${ACCESS_REASSERT_NAME}.timer ${ACCESS_REASSERT_NAME}.service >/dev/null 2>&1 || true
     if sudo test -f ${ACCESS_UNIT}; then
       had_old=1
       sudo cp -p ${ACCESS_UNIT} ${ACCESS_UNIT}.old || exit 1
@@ -892,6 +979,7 @@ commit_access_address() { # host
       sudo mv ${ACCESS_UNIT}.old ${ACCESS_UNIT}
       sudo systemctl daemon-reload
       sudo systemctl enable --now ${ACCESS_UNIT_NAME} >/dev/null 2>&1 || true
+      if sudo test -f ${ACCESS_REASSERT_TIMER}; then sudo systemctl start ${ACCESS_REASSERT_NAME}.timer >/dev/null 2>&1 || true; fi
     else
       sudo systemctl disable ${ACCESS_UNIT_NAME} >/dev/null 2>&1 || true
       sudo rm -f ${ACCESS_UNIT}
@@ -907,7 +995,11 @@ commit_access_address() { # host
     print_ssh_command "$host"
     return 1
   fi
-  log "access address: ${ACCESS_HOST} kept by ${ACCESS_UNIT_NAME}"
+  install_access_reassert "$host" \
+    || { echo "error: ${host}: the access address unit is in place, but its re-assert timer could not be installed, so a network reconfiguration could drop ${ACCESS_HOST}; re-run convert" >&2
+         print_ssh_command "$host"
+         return 1; }
+  log "access address: ${ACCESS_HOST} kept by ${ACCESS_UNIT_NAME}, re-asserted every minute"
 }
 
 convert_host() {
@@ -1091,7 +1183,7 @@ cmd_audit() {
         if [ -z \"\$current\" ]; then state=missing
         elif printf '%s' \"\$current\" | grep -q deprecated; then state=present
         else state=preferred; fi
-        echo \"access=\$access access_state=\$state access_unit=\$(systemctl is-enabled ${ACCESS_UNIT_NAME} 2>/dev/null || echo missing)\"
+        echo \"access=\$access access_state=\$state access_unit=\$(systemctl is-enabled ${ACCESS_UNIT_NAME} 2>/dev/null || echo missing) access_reassert=\$(systemctl is-active ${ACCESS_REASSERT_NAME}.timer 2>/dev/null || echo missing)\"
       fi" 2>/dev/null)" \
       || out="unreachable"
     printf '%s %s\n' "$host" "$(printf '%s' "$out" | scrub_stream | tr '\n' ' ' | head -c 500)"

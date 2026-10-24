@@ -512,7 +512,15 @@ not need to match.
   `foundation-up.sh convert` (or `create`) with `OPENRUNG_ACCESS_HOST=<IPv6>`:
   it writes the variable into the env file and installs
   `openrung-access-address.service`, a host unit that adds the address
-  before docker starts the relay and removes it when stopped:
+  before docker starts the relay and removes it when stopped, plus
+  `openrung-access-address-reassert.timer`. A network manager that
+  reconfigures the interface (systemd-networkd restarted by unattended
+  upgrades, for one) drops addresses it does not own. While the unit is
+  active, the timer runs `/usr/local/sbin/openrung-access-address-reassert`
+  every minute: it re-adds the address the unit names when it is missing (or
+  no longer deprecated) and logs one warning
+  (`re-added access address … on …`); while the address is in place it does
+  and logs nothing. The unit's command:
 
   ```
   ip -6 address replace <IPv6>/128 dev <default-route interface> preferred_lft 0 nodad
@@ -526,7 +534,12 @@ not need to match.
   relay checks, with a read-only netlink query (no capability needed), that
   the address is on a host interface, past duplicate address detection and
   deprecated; when it is not, the relay logs `not advertising access host …`
-  with the reason and registers without it. xray keeps one wildcard listener
+  with the reason and registers without it. The relay repeats the check
+  every 30 seconds: when the address goes missing it logs
+  `access host … is no longer usable` and re-registers without it, so the
+  broker stops handing it out, and when it comes back it re-registers with
+  it. The session, xray and the per-user credentials keep running across
+  these re-registrations. xray keeps one wildcard listener
   — Go opens it as a single dual-stack socket — so the access address needs
   no second listener; the relay refuses an access host with a literal
   `OPENRUNG_LISTEN_HOST`, with connection logging, or outside direct mode.
@@ -543,8 +556,8 @@ not need to match.
   the variable once the roll is verified; leaving it unset keeps whatever the
   host has. The address is static: changing it is a `convert` with the new
   value, which re-registers the relay. `foundation-up.sh audit` reports `access=none`, or the address
-  with `access_state=present|missing|preferred` and whether its unit is
-  enabled. Volunteer relays (`volunteer-up.sh`, the desktop app) never set it.
+  with `access_state=present|missing|preferred`, whether its unit is enabled
+  and whether its re-assert timer is active (`access_reassert=`). Volunteer relays (`volunteer-up.sh`, the desktop app) never set it.
 
 ## Operations
 

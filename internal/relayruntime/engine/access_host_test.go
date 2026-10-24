@@ -298,3 +298,251 @@ func TestDetectedPublicHostNeverIsTheAccessHost(t *testing.T) {
 		})
 	}
 }
+
+// An access address that disappears after registration is withdrawn from the
+// broker within one recheck interval, and advertised again once it is back —
+// without restarting the session.
+func TestAccessHostIsWithdrawnAndRestoredWithoutRestart(t *testing.T) {
+	prev := accessRecheckInterval
+	accessRecheckInterval = 40 * time.Millisecond
+	t.Cleanup(func() { accessRecheckInterval = prev })
+
+	broker := &fakeBroker{}
+	ts := httptest.NewServer(broker.handler())
+	defer ts.Close()
+	log := &syncBuffer{}
+	eng := New(Config{
+		BrokerURL:   ts.URL,
+		Mode:        ModeDirect,
+		PublicHost:  "203.0.113.7",
+		AccessHost:  testAccessHost,
+		ListenPort:  freePort(t),
+		Identity:    testIdentity,
+		DisableXray: true,
+		ConfigDir:   t.TempDir(),
+	}, Events{Log: log})
+	eng.cfg.HeartbeatInterval = time.Hour // only the access recheck re-registers
+	present := []relayruntime.HostAddress{{IP: netip.MustParseAddr(testAccessHost), Deprecated: true}}
+	hosts := &fakeHostAddresses{}
+	hosts.set(present, nil)
+	eng.hostAddresses = hosts.list
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- eng.runDirectSession(ctx, &relayruntime.BrokerClient{BaseURL: ts.URL}, eng.cfg, "access-relay", testIdentity, "", directOnlyListenHost)
+	}()
+	defer func() { cancel(); <-done }()
+
+	eventually(t, 5*time.Second, "first registration", func() bool {
+		registers, _, last := broker.stats()
+		return registers == 1 && last.AccessHost == testAccessHost
+	})
+	// Unchanged state never re-registers.
+	time.Sleep(5 * accessRecheckInterval)
+	if registers, _, _ := broker.stats(); registers != 1 {
+		t.Fatalf("re-registered %d times with nothing changed", registers-1)
+	}
+
+	hosts.set(nil, nil) // the network manager dropped the address
+	eventually(t, 5*time.Second, "withdrawal", func() bool {
+		registers, _, last := broker.stats()
+		return registers == 2 && last.AccessHost == ""
+	})
+	if !strings.Contains(log.String(), "no longer usable") {
+		t.Fatalf("missing the withdrawal log line; log:\n%s", log.String())
+	}
+	time.Sleep(5 * accessRecheckInterval)
+	if registers, _, _ := broker.stats(); registers != 2 {
+		t.Fatalf("kept re-registering while the address stayed missing (%d)", registers)
+	}
+
+	hosts.set(present, nil) // restored
+	eventually(t, 5*time.Second, "restoration", func() bool {
+		registers, _, last := broker.stats()
+		return registers == 3 && last.AccessHost == testAccessHost
+	})
+	if _, _, last := broker.stats(); last.PublicHost != "203.0.113.7" {
+		t.Fatalf("public host changed: %q", last.PublicHost)
+	}
+	select {
+	case err := <-done:
+		t.Fatalf("the session ended: %v", err)
+	default:
+	}
+}
+
+// A relay without an access host never arms the recheck.
+func TestNoAccessHostNeverRechecks(t *testing.T) {
+	prev := accessRecheckInterval
+	accessRecheckInterval = 20 * time.Millisecond
+	t.Cleanup(func() { accessRecheckInterval = prev })
+	broker := &fakeBroker{}
+	ts := httptest.NewServer(broker.handler())
+	defer ts.Close()
+	eng := New(Config{
+		BrokerURL: ts.URL, Mode: ModeDirect, PublicHost: "203.0.113.7",
+		ListenPort: freePort(t), Identity: testIdentity, DisableXray: true, ConfigDir: t.TempDir(),
+	}, Events{})
+	eng.cfg.HeartbeatInterval = time.Hour
+	queried := 0
+	var mu sync.Mutex
+	eng.hostAddresses = func() ([]relayruntime.HostAddress, error) { mu.Lock(); queried++; mu.Unlock(); return nil, nil }
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = eng.runDirectSession(ctx, &relayruntime.BrokerClient{BaseURL: ts.URL}, eng.cfg, "plain", testIdentity, "", directOnlyListenHost)
+	}()
+	eventually(t, 5*time.Second, "registration", func() bool { r, _, _ := broker.stats(); return r == 1 })
+	time.Sleep(10 * accessRecheckInterval)
+	cancel()
+	<-done
+	mu.Lock()
+	defer mu.Unlock()
+	if queried != 0 {
+		t.Fatalf("host addresses queried %d times without an access host", queried)
+	}
+	if r, _, _ := broker.stats(); r != 1 {
+		t.Fatalf("re-registered without an access host: %d", r)
+	}
+}
+
+// An access-host re-registration mints a new lease token while the lease
+// syncer may be holding a long poll on the old one. The stale poll is
+// cancelled and the new session is synchronised and acknowledged at once —
+// not after a heartbeat — so leases issued meanwhile are applied within the
+// broker's acknowledgement wait.
+func TestAccessHostReRegistrationResyncsLeasesImmediately(t *testing.T) {
+	shortRotation(t, time.Hour)
+	shortLeaseTiming(t)
+	prev := accessRecheckInterval
+	accessRecheckInterval = 40 * time.Millisecond
+	t.Cleanup(func() { accessRecheckInterval = prev })
+
+	broker := &fakeBroker{leaseCapable: true, rejectStaleLeaseTokens: true, leaseHold: 20 * time.Second}
+	users := newRecordingUsers()
+	ts := httptest.NewServer(broker.handler())
+	defer ts.Close()
+	eng := New(Config{
+		BrokerURL:   ts.URL,
+		Mode:        ModeDirect,
+		PublicHost:  "203.0.113.7",
+		AccessHost:  testAccessHost,
+		ListenPort:  freePort(t),
+		Identity:    testIdentity,
+		DisableXray: true,
+		ConfigDir:   t.TempDir(),
+	}, Events{})
+	eng.cfg.HeartbeatInterval = time.Hour // a 404 wait would outlast the test
+	eng.newXrayUsers = func(Config, string) relayruntime.XrayUserManager { return users }
+	hosts := &fakeHostAddresses{}
+	hosts.set([]relayruntime.HostAddress{{IP: netip.MustParseAddr(testAccessHost), Deprecated: true}}, nil)
+	eng.hostAddresses = hosts.list
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = eng.runDirectSession(ctx, &relayruntime.BrokerClient{BaseURL: ts.URL}, eng.cfg, "access-relay", testIdentity, "", directOnlyListenHost)
+	}()
+	defer func() { cancel(); <-done }()
+
+	eventually(t, 5*time.Second, "online with the first session acked", func() bool {
+		return eng.Status().Phase == PhaseOnline && len(broker.ackedRevisions()) >= 1
+	})
+	// Let the syncer park in a long poll on the first token.
+	time.Sleep(200 * time.Millisecond)
+
+	hosts.set(nil, nil) // the address disappears: re-register without it
+	eventually(t, 5*time.Second, "withdrawal re-registration", func() bool {
+		registers, _, last := broker.stats()
+		return registers == 2 && last.AccessHost == ""
+	})
+	newToken := func() string { broker.mu.Lock(); defer broker.mu.Unlock(); return broker.currentLeaseToken() }()
+	revision := broker.setLeases(relay.LeaseEntry{ID: "0123456789abcdef0123456789abcdef", Credential: "44444444-2222-4333-8444-555555555555", ExpiresAt: time.Now().Add(time.Hour)})
+	eventually(t, 3*time.Second, "the new session's lease set acked with its own token", func() bool {
+		last, ok := broker.lastAcked()
+		if !ok || last < revision {
+			return false
+		}
+		_, bearers := broker.leaseStats()
+		return len(bearers) > 0 && bearers[len(bearers)-1] == newToken
+	})
+	if emails := users.leaseEmails(); len(emails) != 1 {
+		t.Fatalf("installed lease users = %v, want the issued lease", emails)
+	}
+}
+
+// A re-registration that lands while the lease syncer is backing off after
+// a failed poll ends the backoff: the new session is synchronised at once,
+// not after the (here 30-second) backoff.
+func TestLeaseBackoffEndsOnReRegistration(t *testing.T) {
+	shortRotation(t, time.Hour)
+	minBackoff, maxBackoff, expiry := leaseSyncMinBackoff, leaseSyncMaxBackoff, leaseExpiryInterval
+	leaseSyncMinBackoff, leaseSyncMaxBackoff, leaseExpiryInterval = 30*time.Second, 30*time.Second, time.Hour
+	t.Cleanup(func() { leaseSyncMinBackoff, leaseSyncMaxBackoff, leaseExpiryInterval = minBackoff, maxBackoff, expiry })
+	prev := accessRecheckInterval
+	accessRecheckInterval = 40 * time.Millisecond
+	t.Cleanup(func() { accessRecheckInterval = prev })
+
+	broker := &fakeBroker{leaseCapable: true, rejectStaleLeaseTokens: true}
+	users := newRecordingUsers()
+	ts := httptest.NewServer(broker.handler())
+	defer ts.Close()
+	eng := New(Config{
+		BrokerURL:   ts.URL,
+		Mode:        ModeDirect,
+		PublicHost:  "203.0.113.7",
+		AccessHost:  testAccessHost,
+		ListenPort:  freePort(t),
+		Identity:    testIdentity,
+		DisableXray: true,
+		ConfigDir:   t.TempDir(),
+	}, Events{})
+	eng.cfg.HeartbeatInterval = time.Hour
+	eng.newXrayUsers = func(Config, string) relayruntime.XrayUserManager { return users }
+	hosts := &fakeHostAddresses{}
+	hosts.set([]relayruntime.HostAddress{{IP: netip.MustParseAddr(testAccessHost), Deprecated: true}}, nil)
+	eng.hostAddresses = hosts.list
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = eng.runDirectSession(ctx, &relayruntime.BrokerClient{BaseURL: ts.URL}, eng.cfg, "access-relay", testIdentity, "", directOnlyListenHost)
+	}()
+	defer func() { cancel(); <-done }()
+	eventually(t, 5*time.Second, "online with the first session acked", func() bool {
+		return eng.Status().Phase == PhaseOnline && len(broker.ackedRevisions()) >= 1
+	})
+
+	// Polls start failing; the syncer falls into its 30-second backoff.
+	broker.mu.Lock()
+	broker.failLeasePolls = true
+	broker.mu.Unlock()
+	eventually(t, 5*time.Second, "a failed poll", func() bool {
+		polls, _ := broker.leaseStats()
+		return polls >= 2
+	})
+	time.Sleep(300 * time.Millisecond) // well inside the backoff
+	broker.mu.Lock()
+	broker.failLeasePolls = false
+	broker.mu.Unlock()
+
+	hosts.set(nil, nil) // re-register without the access host
+	eventually(t, 5*time.Second, "withdrawal re-registration", func() bool {
+		registers, _, last := broker.stats()
+		return registers == 2 && last.AccessHost == ""
+	})
+	newToken := func() string { broker.mu.Lock(); defer broker.mu.Unlock(); return broker.currentLeaseToken() }()
+	revision := broker.setLeases(relay.LeaseEntry{ID: "0123456789abcdef0123456789abcdef", Credential: "44444444-2222-4333-8444-555555555555", ExpiresAt: time.Now().Add(time.Hour)})
+	eventually(t, 3*time.Second, "the new session acked despite the backoff", func() bool {
+		last, ok := broker.lastAcked()
+		if !ok || last < revision {
+			return false
+		}
+		_, bearers := broker.leaseStats()
+		return len(bearers) > 0 && bearers[len(bearers)-1] == newToken
+	})
+}
